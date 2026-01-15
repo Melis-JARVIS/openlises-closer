@@ -10,6 +10,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "chalk": "^5.6.2",
     "express": "^4.21.2"
   }
 }
