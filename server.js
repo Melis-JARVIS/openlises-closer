@@ -1,17 +1,32 @@
 import express from "express";
 import chalk from "chalk";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const COMPANY = process.env.COMPANY_NAME || "JARVIS";
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 
 // parse body from Bitrix BP webhook
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// helpers
+// --- DB ---
+if (!process.env.DATABASE_URL) {
+  console.warn(
+    "[warn] DATABASE_URL is not set. Add Postgres plugin in Railway or set DATABASE_URL variable."
+  );
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Railway обычно требует SSL
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+});
+
+// --- helpers ---
 const nowIso = () => new Date().toISOString();
 
 function pick(obj, keys) {
@@ -45,7 +60,6 @@ function extractDealId({ query, body }) {
 }
 
 function statusBadge(status) {
-  // status: OK | ERROR | WARN | INFO
   const map = {
     OK: chalk.bgGreen.black(" OK "),
     ERROR: chalk.bgRed.white(" ERROR "),
@@ -55,21 +69,25 @@ function statusBadge(status) {
   return map[status] || chalk.bgGray.white(` ${status} `);
 }
 
-function logBlock({ status = "INFO", title, meta = {}, details = null }) {
+function logBlock({
+  companyName = "JARVIS",
+  status = "INFO",
+  title,
+  meta = {},
+  details = null,
+}) {
   const prefix =
     chalk.gray(`[${nowIso()}]`) +
     " " +
-    chalk.cyan(`[${COMPANY}]`) +
+    chalk.cyan(`[${companyName}]`) +
     " " +
     statusBadge(status);
   console.log(`${prefix} ${title}`);
 
-  // краткий мета-блок (1–2 строки)
   if (Object.keys(meta).length) {
     console.log(chalk.gray("  ├─ meta:"), JSON.stringify(meta));
   }
 
-  // подробности (по желанию)
   if (details && (LOG_LEVEL === "debug" || status === "ERROR")) {
     console.log(chalk.gray("  └─ details:"));
     console.log(chalk.gray(JSON.stringify(details, null, 2)));
@@ -78,46 +96,108 @@ function logBlock({ status = "INFO", title, meta = {}, details = null }) {
   console.log(chalk.gray("—".repeat(72)));
 }
 
-// health
+// --- Bitrix REST via webhook url ---
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 8000);
+
+async function bx(
+  company,
+  method,
+  params = {},
+  { timeoutMs = REQUEST_TIMEOUT_MS } = {}
+) {
+  const base = String(company.bitrix_webhook_url || "").replace(/\/?$/, "/");
+  if (!base.startsWith("http"))
+    throw new Error("bitrix_webhook_url is empty/invalid");
+
+  const url = `${base}${method}`;
+
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    body.append(k, typeof v === "string" ? v : String(v));
+  }
+
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+      signal: ac.signal,
+    });
+
+    const json = await res.json().catch(() => ({}));
+
+    if (!res.ok || json.error) {
+      const m =
+        json.error_description ||
+        json.error ||
+        res.statusText ||
+        "Unknown error";
+      throw new Error(`${method} → ${m}`);
+    }
+    return json.result;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function getCompanyByMemberId(memberId) {
+  const { rows } = await pool.query(
+    `SELECT id, name, member_id, bitrix_webhook_url, enabled
+     FROM companies
+     WHERE member_id = $1
+     LIMIT 1`,
+    [memberId]
+  );
+  return rows[0] || null;
+}
+
+async function finishOpenlinesChatIfAny(company, dealId) {
+  // 1) найти последний чат по сделке
+  const chatId = await bx(company, "imopenlines.crm.chat.getLastId", {
+    CRM_ENTITY_TYPE: "DEAL",
+    CRM_ENTITY: String(dealId),
+  });
+
+  if (!chatId || Number(chatId) <= 0) {
+    return { found: false, finished: false, chatId: chatId ?? null };
+  }
+
+  // 2) закрыть чат
+  await bx(company, "imopenlines.operator.another.finish", {
+    CHAT_ID: String(chatId),
+  });
+  return { found: true, finished: true, chatId: String(chatId) };
+}
+
+// --- health ---
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
-// основной обработчик БП
+// --- webhook handler ---
 app.post("/", (req, res) => {
-  // отвечаем сразу
+  // отвечаем сразу (Битрикс любит быстрый 200)
   res.sendStatus(200);
 
-  const requestId = req.headers["x-railway-request-id"];
-  const ip = getIp(req);
+  (async () => {
+    const requestId = req.headers["x-railway-request-id"];
+    const ip = getIp(req);
+    const query = req.query || {};
+    const body = req.body || {};
 
-  const query = req.query || {};
-  const body = req.body || {};
+    const dealId = extractDealId({ query, body });
 
-  const dealId = extractDealId({ query, body });
+    // из Bitrix BP обычно приходит auth.member_id
+    const memberId = body?.auth?.member_id ? String(body.auth.member_id) : null;
 
-  try {
-    // пример проверки токена (если захочешь)
-    // const token = String(query.token || body.token || "");
-    // if (process.env.BP_TOKEN && token !== process.env.BP_TOKEN) {
-    //   logBlock({
-    //     status: "WARN",
-    //     title: `BP webhook ignored (invalid token)`,
-    //     meta: { requestId, ip, dealId },
-    //   });
-    //   return;
-    // }
-
+    // Лог-заголовок (ещё без имени компании)
     logBlock({
-      status: "OK",
-      title: `BP webhook received`,
-      meta: {
-        requestId,
-        ip,
-        method: req.method,
-        path: req.originalUrl,
-        dealId,
-        contentType: req.headers["content-type"],
-      },
+      companyName: "JARVIS",
+      status: "INFO",
+      title: "BP webhook received (raw)",
+      meta: { requestId, ip, dealId, memberId, path: req.originalUrl },
       details: {
         query,
         body,
@@ -125,37 +205,116 @@ app.post("/", (req, res) => {
           "user-agent",
           "x-forwarded-for",
           "x-real-ip",
-          "x-forwarded-proto",
-          "x-forwarded-host",
-          "host",
+          "content-type",
         ]),
       },
     });
 
-    // тут позже будет логика действий (закрыть чат и т.д.)
-    // если действие ок:
-    // logBlock({ status:"OK", title:"OpenLines chat closed", meta:{ requestId, dealId, chatId } })
-    // если ошибка:
-    // logBlock({ status:"ERROR", title:"OpenLines close failed", meta:{ requestId, dealId }, details:{ error: e.message } })
-  } catch (e) {
-    logBlock({
-      status: "ERROR",
-      title: `BP webhook handler failed`,
-      meta: { requestId, ip, dealId },
-      details: { error: e?.message, stack: e?.stack, query, body },
-    });
-  }
+    try {
+      if (!dealId) {
+        logBlock({
+          companyName: "JARVIS",
+          status: "WARN",
+          title: "dealId not found, ignore",
+          meta: { requestId, ip, memberId },
+        });
+        return;
+      }
+
+      if (!memberId) {
+        logBlock({
+          companyName: "JARVIS",
+          status: "WARN",
+          title: "member_id not found in body.auth, ignore",
+          meta: { requestId, ip, dealId },
+        });
+        return;
+      }
+
+      const company = await getCompanyByMemberId(memberId);
+
+      if (!company) {
+        logBlock({
+          companyName: "JARVIS",
+          status: "WARN",
+          title: "Company not found in DB, ignore",
+          meta: { requestId, memberId, dealId },
+        });
+        return;
+      }
+
+      if (!company.enabled) {
+        logBlock({
+          companyName: company.name,
+          status: "WARN",
+          title: "Company disabled, ignore",
+          meta: { requestId, memberId, dealId },
+        });
+        return;
+      }
+
+      if (!company.bitrix_webhook_url) {
+        logBlock({
+          companyName: company.name,
+          status: "ERROR",
+          title: "bitrix_webhook_url is NULL/empty in DB",
+          meta: { requestId, memberId, dealId, companyId: company.id },
+        });
+        return;
+      }
+
+      // Закрываем чат (если есть)
+      logBlock({
+        companyName: company.name,
+        status: "INFO",
+        title: "Trying to close OpenLines chat for deal",
+        meta: { requestId, dealId },
+      });
+
+      const r = await finishOpenlinesChatIfAny(company, dealId);
+
+      if (!r.found) {
+        logBlock({
+          companyName: company.name,
+          status: "WARN",
+          title: "OpenLines chat not found for deal",
+          meta: { requestId, dealId, chatId: r.chatId },
+        });
+        return;
+      }
+
+      logBlock({
+        companyName: company.name,
+        status: "OK",
+        title: "OpenLines chat closed",
+        meta: { requestId, dealId, chatId: r.chatId },
+      });
+    } catch (e) {
+      logBlock({
+        companyName: "JARVIS",
+        status: "ERROR",
+        title: "Handler failed",
+        meta: { requestId, dealId, memberId },
+        details: { error: e?.message, stack: e?.stack },
+      });
+    }
+  })();
 });
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   logBlock({
+    companyName: "JARVIS",
     status: "INFO",
-    title: `Server started`,
+    title: "Server started",
     meta: { port: PORT, node: process.version },
   });
 });
 
 process.on("SIGTERM", () => {
-  logBlock({ status: "WARN", title: "SIGTERM received, shutting down..." });
+  logBlock({
+    companyName: "JARVIS",
+    status: "WARN",
+    title: "SIGTERM received, shutting down...",
+  });
   server.close(() => process.exit(0));
 });
