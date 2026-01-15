@@ -191,58 +191,33 @@ function isCouldNotFindCrmEntityError(err) {
  * because Bitrix portals can store CRM bindings differently.
  */
 async function getLastOpenlinesChatIdForDeal(company, dealId) {
-  const candidates = [
-    {
-      CRM_ENTITY_TYPE: "DEAL",
-      CRM_ENTITY: String(dealId),
-      label: "DEAL + 475509",
-    },
-    {
-      CRM_ENTITY_TYPE: "DEAL",
-      CRM_ENTITY: `DEAL_${dealId}`,
-      label: "DEAL + DEAL_475509",
-    },
-    {
-      CRM_ENTITY_TYPE: "CRM",
-      CRM_ENTITY: `D_${dealId}`,
-      label: "CRM + D_475509",
-    },
-    {
-      CRM_ENTITY_TYPE: "CRM",
-      CRM_ENTITY: String(dealId),
-      label: "CRM + 475509",
-    },
-  ];
-
-  let lastErr = null;
-
-  for (const c of candidates) {
-    try {
-      const chatId = await bx(company, "imopenlines.crm.chat.getLastId", {
-        CRM_ENTITY_TYPE: c.CRM_ENTITY_TYPE,
-        CRM_ENTITY: c.CRM_ENTITY,
-      });
-
-      if (!chatId || Number(chatId) <= 0) {
-        return { chatId: null, tried: c.label };
-      }
-
-      return { chatId: String(chatId), tried: c.label };
-    } catch (e) {
-      lastErr = e;
-
-      // If this is just “wrong binding format”, try next candidate.
-      if (isCouldNotFindCrmEntityError(e)) continue;
-
-      // Real error (ACCESS_DENIED, timeout, etc.)
-      throw e;
-    }
+  const id = Number(dealId);
+  if (!Number.isFinite(id)) {
+    return { chatId: null, reason: "invalid dealId" };
   }
 
-  // All formats failed (usually Could not find CRM entity)
-  throw (
-    lastErr || new Error("imopenlines.crm.chat.getLastId failed (all formats)")
-  );
+  try {
+    const chatId = await bx(company, "imopenlines.crm.chat.getLastId", {
+      CRM_ENTITY_TYPE: "DEAL",
+      CRM_ENTITY: id, // ✅ строго число
+    });
+
+    if (!chatId || Number(chatId) <= 0) {
+      return { chatId: null, reason: "no chat" };
+    }
+
+    return { chatId: String(chatId) };
+  } catch (e) {
+    const msg = String(e?.message || "");
+
+    // ❗ нормальная ситуация — просто нет чата
+    if (msg.includes("Could not find CRM entity")) {
+      return { chatId: null, reason: "no chat" };
+    }
+
+    // ❌ реальная ошибка
+    throw e;
+  }
 }
 
 /**
