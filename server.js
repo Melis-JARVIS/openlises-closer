@@ -1,10 +1,16 @@
+// server.js
+// Node.js 18+ (ESM). Express webhook receiver for Bitrix24 BP.
+// Flow: receive BP webhook -> extract dealId + memberId -> lookup company in Postgres
+// -> find last OpenLines chat for deal (cheap) -> if none: exit early -> else close chat.
+// Logs: colored OK/WARN/ERROR with company name.
+
 import express from "express";
 import chalk from "chalk";
 import pg from "pg";
+
 process.on("unhandledRejection", (err) => {
   console.error("[FATAL] unhandledRejection:", err);
 });
-
 process.on("uncaughtException", (err) => {
   console.error("[FATAL] uncaughtException:", err);
 });
@@ -15,25 +21,38 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 8000);
 
-// parse body from Bitrix BP webhook
+// Parse Bitrix BP webhook payloads (usually x-www-form-urlencoded + some arrays)
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// --- DB ---
+// ---- DB ----
 if (!process.env.DATABASE_URL) {
-  console.warn(
-    "[warn] DATABASE_URL is not set. Add Postgres plugin in Railway or set DATABASE_URL variable."
+  // Fail fast: without DB we can't map member_id -> company -> bitrix webhook url
+  throw new Error(
+    "DATABASE_URL is not set. Add it in Railway service Variables."
   );
 }
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway обычно требует SSL
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+  // Railway Postgres commonly needs SSL
+  ssl: { rejectUnauthorized: false },
 });
 
-// --- helpers ---
+// Optional: quick DB connectivity check at boot (helps debugging)
+(async () => {
+  try {
+    const r = await pool.query("SELECT 1 AS ok");
+    console.log("[DB] connected:", r.rows?.[0] || {});
+  } catch (e) {
+    console.error("[DB] connect failed:", e?.message || e);
+    process.exit(1);
+  }
+})();
+
+// ---- helpers ----
 const nowIso = () => new Date().toISOString();
 
 function pick(obj, keys) {
@@ -103,18 +122,29 @@ function logBlock({
   console.log(chalk.gray("—".repeat(72)));
 }
 
-// --- Bitrix REST via webhook url ---
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 8000);
+// ---- DB queries ----
+async function getCompanyByMemberId(memberId) {
+  const { rows } = await pool.query(
+    `SELECT id, name, member_id, bitrix_webhook_url, enabled
+     FROM companies
+     WHERE member_id = $1
+     LIMIT 1`,
+    [memberId]
+  );
+  return rows[0] || null;
+}
 
+// ---- Bitrix REST via webhook url ----
 async function bx(
   company,
   method,
   params = {},
   { timeoutMs = REQUEST_TIMEOUT_MS } = {}
 ) {
-  const base = String(company.bitrix_webhook_url || "").replace(/\/?$/, "/");
-  if (!base.startsWith("http"))
+  const base = String(company?.bitrix_webhook_url || "").replace(/\/?$/, "/");
+  if (!base || !base.startsWith("http")) {
     throw new Error("bitrix_webhook_url is empty/invalid");
+  }
 
   const url = `${base}${method}`;
 
@@ -144,48 +174,102 @@ async function bx(
         "Unknown error";
       throw new Error(`${method} → ${m}`);
     }
+
     return json.result;
   } finally {
     clearTimeout(t);
   }
 }
 
-async function getCompanyByMemberId(memberId) {
-  const { rows } = await pool.query(
-    `SELECT id, name, member_id, bitrix_webhook_url, enabled
-     FROM companies
-     WHERE member_id = $1
-     LIMIT 1`,
-    [memberId]
-  );
-  return rows[0] || null;
+function isCouldNotFindCrmEntityError(err) {
+  const msg = String(err?.message || "");
+  return msg.includes("Could not find CRM entity");
 }
 
-async function finishOpenlinesChatIfAny(company, dealId) {
-  // 1) найти последний чат по сделке
-  const chatId = await bx(company, "imopenlines.crm.chat.getLastId", {
-    CRM_ENTITY_TYPE: "DEAL",
-    CRM_ENTITY: String(dealId),
-  });
+/**
+ * Finds last OpenLines chatId linked to a deal. Tries multiple entity formats
+ * because Bitrix portals can store CRM bindings differently.
+ */
+async function getLastOpenlinesChatIdForDeal(company, dealId) {
+  const candidates = [
+    {
+      CRM_ENTITY_TYPE: "DEAL",
+      CRM_ENTITY: String(dealId),
+      label: "DEAL + 475509",
+    },
+    {
+      CRM_ENTITY_TYPE: "DEAL",
+      CRM_ENTITY: `DEAL_${dealId}`,
+      label: "DEAL + DEAL_475509",
+    },
+    {
+      CRM_ENTITY_TYPE: "CRM",
+      CRM_ENTITY: `D_${dealId}`,
+      label: "CRM + D_475509",
+    },
+    {
+      CRM_ENTITY_TYPE: "CRM",
+      CRM_ENTITY: String(dealId),
+      label: "CRM + 475509",
+    },
+  ];
 
-  if (!chatId || Number(chatId) <= 0) {
-    return { found: false, finished: false, chatId: chatId ?? null };
+  let lastErr = null;
+
+  for (const c of candidates) {
+    try {
+      const chatId = await bx(company, "imopenlines.crm.chat.getLastId", {
+        CRM_ENTITY_TYPE: c.CRM_ENTITY_TYPE,
+        CRM_ENTITY: c.CRM_ENTITY,
+      });
+
+      if (!chatId || Number(chatId) <= 0) {
+        return { chatId: null, tried: c.label };
+      }
+
+      return { chatId: String(chatId), tried: c.label };
+    } catch (e) {
+      lastErr = e;
+
+      // If this is just “wrong binding format”, try next candidate.
+      if (isCouldNotFindCrmEntityError(e)) continue;
+
+      // Real error (ACCESS_DENIED, timeout, etc.)
+      throw e;
+    }
   }
 
-  // 2) закрыть чат
-  await bx(company, "imopenlines.operator.another.finish", {
-    CHAT_ID: String(chatId),
-  });
-  return { found: true, finished: true, chatId: String(chatId) };
+  // All formats failed (usually Could not find CRM entity)
+  throw (
+    lastErr || new Error("imopenlines.crm.chat.getLastId failed (all formats)")
+  );
 }
 
-// --- health ---
+/**
+ * Close last OpenLines chat if exists.
+ * EARLY EXIT: if no chat -> returns found=false quickly (no extra CRM calls).
+ */
+async function finishOpenlinesChatIfAny(company, dealId) {
+  const { chatId, tried } = await getLastOpenlinesChatIdForDeal(
+    company,
+    dealId
+  );
+
+  if (!chatId) {
+    return { found: false, finished: false, chatId: null, tried };
+  }
+
+  await bx(company, "imopenlines.operator.another.finish", { CHAT_ID: chatId });
+  return { found: true, finished: true, chatId, tried };
+}
+
+// ---- health endpoints ----
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
-// --- webhook handler ---
+// ---- Bitrix BP webhook endpoint ----
 app.post("/", (req, res) => {
-  // отвечаем сразу (Битрикс любит быстрый 200)
+  // Reply immediately to Bitrix
   res.sendStatus(200);
 
   (async () => {
@@ -195,11 +279,9 @@ app.post("/", (req, res) => {
     const body = req.body || {};
 
     const dealId = extractDealId({ query, body });
-
-    // из Bitrix BP обычно приходит auth.member_id
     const memberId = body?.auth?.member_id ? String(body.auth.member_id) : null;
 
-    // Лог-заголовок (ещё без имени компании)
+    // Raw incoming log
     logBlock({
       companyName: "JARVIS",
       status: "INFO",
@@ -218,11 +300,12 @@ app.post("/", (req, res) => {
     });
 
     try {
+      // Early validations (cheap)
       if (!dealId) {
         logBlock({
           companyName: "JARVIS",
           status: "WARN",
-          title: "dealId not found, ignore",
+          title: "dealId not found, skip",
           meta: { requestId, ip, memberId },
         });
         return;
@@ -232,19 +315,20 @@ app.post("/", (req, res) => {
         logBlock({
           companyName: "JARVIS",
           status: "WARN",
-          title: "member_id not found in body.auth, ignore",
+          title: "member_id not found in body.auth, skip",
           meta: { requestId, ip, dealId },
         });
         return;
       }
 
+      // Company lookup (DB)
       const company = await getCompanyByMemberId(memberId);
 
       if (!company) {
         logBlock({
           companyName: "JARVIS",
           status: "WARN",
-          title: "Company not found in DB, ignore",
+          title: "Company not found in DB, skip",
           meta: { requestId, memberId, dealId },
         });
         return;
@@ -254,8 +338,8 @@ app.post("/", (req, res) => {
         logBlock({
           companyName: company.name,
           status: "WARN",
-          title: "Company disabled, ignore",
-          meta: { requestId, memberId, dealId },
+          title: "Company disabled, skip",
+          meta: { requestId, memberId, dealId, companyId: company.id },
         });
         return;
       }
@@ -270,7 +354,7 @@ app.post("/", (req, res) => {
         return;
       }
 
-      // Закрываем чат (если есть)
+      // EARLY EXIT PATH: check if there is a chat and close it; if no chat, stop.
       logBlock({
         companyName: company.name,
         status: "INFO",
@@ -283,9 +367,9 @@ app.post("/", (req, res) => {
       if (!r.found) {
         logBlock({
           companyName: company.name,
-          status: "WARN",
-          title: "OpenLines chat not found for deal",
-          meta: { requestId, dealId, chatId: r.chatId },
+          status: "OK",
+          title: "No active OpenLines chat for deal (skip early)",
+          meta: { requestId, dealId, tried: r.tried },
         });
         return;
       }
@@ -294,11 +378,13 @@ app.post("/", (req, res) => {
         companyName: company.name,
         status: "OK",
         title: "OpenLines chat closed",
-        meta: { requestId, dealId, chatId: r.chatId },
+        meta: { requestId, dealId, chatId: r.chatId, tried: r.tried },
       });
     } catch (e) {
+      // Prefer company name if we already have it, otherwise JARVIS
+      const companyNameGuess = "JARVIS";
       logBlock({
-        companyName: "JARVIS",
+        companyName: companyNameGuess,
         status: "ERROR",
         title: "Handler failed",
         meta: { requestId, dealId, memberId },
@@ -308,12 +394,13 @@ app.post("/", (req, res) => {
   })();
 });
 
+// ---- start server ----
 const server = app.listen(PORT, "0.0.0.0", () => {
   logBlock({
     companyName: "JARVIS",
     status: "INFO",
     title: "Server started",
-    meta: { port: PORT, node: process.version },
+    meta: { port: String(PORT), node: process.version },
   });
 });
 
