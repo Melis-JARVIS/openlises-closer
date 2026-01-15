@@ -2,25 +2,35 @@
 // Node.js 18+ (ESM). Express webhook receiver for Bitrix24 BP.
 // Поток: приняли вебхук БП -> достали dealId + memberId -> нашли компанию в Postgres
 // -> нашли последний чат Открытых линий по сделке -> если чата нет/уже закрыт: ранний выход
-// -> если чат есть: закрыли -> лог OK/ОШБ на русском, без дубляжа даты (Railway сам показывает время).
+// -> если чат есть: закрыли -> логи на русском, без дубляжа даты (Railway сам показывает время).
 
 import express from "express";
 import chalk from "chalk";
 import pg from "pg";
 
-process.on("unhandledRejection", (err) => {
-  console.error("[FATAL] unhandledRejection:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL] uncaughtException:", err);
-});
+// --- Полное логирование фатальных ошибок (всегда) ---
+function fatalLog(err, title = "Фатальная ошибка") {
+  const payload = {
+    title,
+    message: err?.message || String(err),
+    name: err?.name,
+    stack: err?.stack,
+  };
+  console.error(`[СИСТЕМА] ERROR ${title}`);
+  console.error(JSON.stringify(payload, null, 2));
+}
 
+process.on("unhandledRejection", (err) =>
+  fatalLog(err, "Необработанный Promise rejection")
+);
+process.on("uncaughtException", (err) =>
+  fatalLog(err, "Необработанное исключение (uncaughtException)")
+);
+
+// --- App ---
 const { Pool } = pg;
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase(); // info | debug
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 8000);
 
 // Bitrix BP обычно шлёт form-urlencoded + иногда массивы
@@ -39,24 +49,25 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }, // Railway Postgres часто требует SSL
 });
 
-// Тест коннекта к БД при старте (можно оставить)
+// Тест коннекта к БД при старте (оставляем, полезно)
 (async () => {
   try {
     const r = await pool.query("SELECT 1 AS ok");
-    console.log("[DB] подключено:", r.rows?.[0] || {});
+    console.log(`[DB] подключено: ${JSON.stringify(r.rows?.[0] || {})}`);
   } catch (e) {
-    console.error("[DB] ошибка подключения:", e?.message || e);
+    console.error(`[DB] ошибка подключения: ${e?.message || e}`);
+    console.error(e?.stack || "");
     process.exit(1);
   }
 })();
 
-// ---- ЛОГГЕР (русский, без даты — Railway сам показывает время слева) ----
+// ---- ЛОГГЕР (русский, без даты) ----
 function tag(status) {
   const map = {
     OK: chalk.green("OK "),
-    ERROR: chalk.red("ОШБ"),
-    WARN: chalk.yellow("ВНМ"),
-    INFO: chalk.cyan("ИНФ"),
+    ERROR: chalk.red("ERROR"),
+    WARN: chalk.yellow("WARN"),
+    INFO: chalk.cyan("INFO"),
   };
   return map[status] || status;
 }
@@ -84,10 +95,33 @@ function log({ company = "СИСТЕМА", status = "INFO", message, meta = {} }
   );
 }
 
-function logDebug(label, data) {
-  if (LOG_LEVEL !== "debug") return;
-  console.log(chalk.gray(`  ↳ ${label}:`));
-  console.log(chalk.gray(JSON.stringify(data, null, 2)));
+// Полный вывод ошибки (ВСЕГДА, без LOG_LEVEL)
+function logErrorFull({
+  company = "СИСТЕМА",
+  message,
+  meta = {},
+  err,
+  context = {},
+}) {
+  log({
+    company,
+    status: "ERROR",
+    message,
+    meta: { ...meta, error: err?.message || String(err) },
+  });
+
+  const payload = {
+    error: {
+      message: err?.message || String(err),
+      name: err?.name,
+      stack: err?.stack,
+    },
+    meta,
+    context,
+  };
+
+  console.log(chalk.gray("  ↳ Полные детали ошибки:"));
+  console.log(chalk.gray(JSON.stringify(payload, null, 2)));
 }
 
 // ---- HELPERS ----
@@ -208,7 +242,6 @@ async function getLastOpenlinesChatIdForDeal(company, dealId) {
       return { chatId: null, reason: "Активный чат не найден" };
     }
 
-    // Любая другая ошибка — реальная ошибка интеграции
     throw e;
   }
 }
@@ -247,26 +280,13 @@ app.post("/", (req, res) => {
     const dealId = extractDealId({ query, body });
     const memberId = body?.auth?.member_id ? String(body.auth.member_id) : null;
 
-    // Лог входящего вебхука (компания ещё неизвестна — пишем "СИСТЕМА")
+    // Лог входящего вебхука (компания ещё неизвестна)
     log({
       company: "СИСТЕМА",
       status: "INFO",
       message: "Получен вебхук бизнес-процесса",
       meta: { requestId, ip, dealId, memberId, path: req.originalUrl },
     });
-
-    // Детали — только в debug
-    logDebug(
-      "Заголовки",
-      pick(req.headers, [
-        "user-agent",
-        "content-type",
-        "x-forwarded-for",
-        "x-real-ip",
-      ])
-    );
-    logDebug("Query", query);
-    logDebug("Body", body);
 
     let companyName = "СИСТЕМА";
 
@@ -354,13 +374,25 @@ app.post("/", (req, res) => {
         meta: { requestId, dealId, chatId: r.chatId },
       });
     } catch (e) {
-      log({
+      // Полный лог ошибки (всегда)
+      logErrorFull({
         company: companyName,
-        status: "ERROR",
         message: "Ошибка при обработке вебхука",
         meta: { requestId, dealId, memberId },
+        err: e,
+        context: {
+          ip,
+          path: req.originalUrl,
+          query,
+          body,
+          headers: pick(req.headers, [
+            "user-agent",
+            "content-type",
+            "x-forwarded-for",
+            "x-real-ip",
+          ]),
+        },
       });
-      logDebug("Детали ошибки", { error: e?.message, stack: e?.stack });
     }
   })();
 });
