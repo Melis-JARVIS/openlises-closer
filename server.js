@@ -1,6 +1,13 @@
 import express from "express";
 import chalk from "chalk";
 import pg from "pg";
+process.on("unhandledRejection", (err) => {
+  console.error("[FATAL] unhandledRejection:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] uncaughtException:", err);
+});
 
 const { Pool } = pg;
 
